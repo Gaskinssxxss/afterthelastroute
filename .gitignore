@@ -1,0 +1,7 @@
+evidence/
+clab-routing-lab/
+*.log
+__pycache__/
+.pytest_cache/
+.venv/
+*.retry

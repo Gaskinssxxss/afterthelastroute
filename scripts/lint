@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cd "$(dirname -- "${BASH_SOURCE[0]}")/.."
+command -v shellcheck >/dev/null && shellcheck scripts/lab scripts/lint
+python3 - <<'PY'
+from pathlib import Path
+try:
+    import yaml
+except ImportError as exc:
+    raise SystemExit("PyYAML is required for YAML linting: python3 -m pip install PyYAML") from exc
+for path in [Path("topology.clab.yml")]:
+    with path.open(encoding="utf-8") as f:
+        yaml.safe_load(f)
+    print(f"PASS: YAML parses: {path}")
+PY
+if command -v gitleaks >/dev/null; then gitleaks detect --no-git --source .; else echo 'SKIP: gitleaks not installed'; fi

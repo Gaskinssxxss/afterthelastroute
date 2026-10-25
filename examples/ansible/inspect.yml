@@ -1,0 +1,23 @@
+---
+- name: Read FRRouting state from the local Containerlab Docker containers
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Read remote endpoint route from R1
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - clab-routing-lab-r1
+          - vtysh
+          - -c
+          - show ip route 10.20.40.0/24
+      changed_when: false
+      register: route
+    - name: Print routing state
+      ansible.builtin.debug:
+        var: route.stdout_lines
+    - name: Require the remote prefix in R1's FRR RIB
+      ansible.builtin.assert:
+        that: route.stdout is search('Known via "bgp"')

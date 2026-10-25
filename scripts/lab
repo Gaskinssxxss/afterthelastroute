@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+TOPOLOGY="$ROOT/topology.clab.yml"
+LAB_NAME=routing-lab
+EVIDENCE="$ROOT/evidence"
+TIMEOUT="${LAB_TIMEOUT_SECONDS:-60}"
+cd "$ROOT"
+
+die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
+docker_ok() { docker info >/dev/null 2>&1 || die 'Docker daemon unavailable; use an authorized Docker-socket account'; }
+node() { docker exec "clab-${LAB_NAME}-$1" "${@:2}"; }
+frr() { node "$1" vtysh -c "$2"; }
+wait_for() {
+  local description="$1"; shift
+  local start now elapsed
+  start=$(date +%s)
+  while (( $(date +%s) - start < TIMEOUT )); do
+    if "$@" >/dev/null 2>&1; then
+      now=$(date +%s); elapsed=$((now-start))
+      printf 'PASS: %s (converged in %ss)\n' "$description" "$elapsed"
+      return 0
+    fi
+    sleep 2
+  done
+  printf 'FAIL: timeout waiting for %s (%ss)\n' "$description" "$TIMEOUT" >&2
+  return 1
+}
+has_route() { frr "$1" "show ip route $2" | grep -qE 'Known via "bgp"|B[*> ]'; }
+bgp_established() {
+  frr "$1" 'show ip bgp summary' | awk 'NR>1 && $1 ~ /^[0-9]+\./ && $10 ~ /^[0-9]+$/ {found=1} END {exit !found}'
+}
+ospf_full() { frr "$1" 'show ip ospf neighbor' | grep -q 'Full'; }
+ping_clients() { node client-a ping -c 2 -W 2 10.20.40.10; }
+
+preflight() {
+  need ip; need docker; need containerlab; need python3
+  [[ $(uname -s) == Linux ]] || die 'Linux is required'
+  [[ $(uname -m) == x86_64 || $(uname -m) == aarch64 ]] || die 'unsupported CPU architecture'
+  [[ -e /proc/sys/net/ipv4/ip_forward ]] || die 'kernel IPv4 networking is unavailable'
+  for module in veth bridge; do
+    if [[ ! -d "/sys/module/$module" ]]; then
+      command -v modprobe >/dev/null 2>&1 || die "kernel module $module is not loaded and modprobe is unavailable"
+      modprobe -n -q "$module" >/dev/null 2>&1 || die "kernel networking module $module is unavailable"
+    fi
+  done
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    [[ ${ID:-} == ubuntu || ${ID_LIKE:-} == *debian* ]] || printf 'WARN: distribution %s is not an explicitly tested Ubuntu/Debian host\n' "${PRETTY_NAME:-unknown}"
+  fi
+  docker_ok
+  clab_version=$(containerlab version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+  [[ -n $clab_version ]] || die 'could not determine Containerlab version'
+  [[ $(printf '%s\n%s\n' 0.80.0 "$clab_version" | sort -V | head -n 1) == 0.80.0 ]] || die "Containerlab 0.80.0 or newer required (found $clab_version)"
+  printf 'Containerlab %s\n' "$clab_version"
+  available_kb=$(df -Pk "$ROOT" | awk 'NR==2 {print $4}')
+  (( available_kb > 2097152 )) || die 'less than 2 GiB free disk space'
+  mem_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+  (( mem_kb > 2097152 )) || die 'less than 2 GiB available RAM'
+  ip -4 route show | python3 -c '
+import ipaddress, sys
+target=ipaddress.ip_network("172.31.250.0/24")
+for line in sys.stdin:
+    candidate=line.split()[0]
+    if candidate == "default":
+        continue
+    try:
+        subnet=ipaddress.ip_network(candidate, strict=False)
+    except ValueError:
+        continue
+    if target.overlaps(subnet):
+        print(f"Host route overlap: {subnet}", file=sys.stderr)
+        sys.exit(1)
+' || die 'management subnet overlaps an existing host route'
+  if docker network inspect routing-lab-mgmt >/dev/null 2>&1; then die 'Docker network routing-lab-mgmt already exists; preserve it and choose a reviewed alternate name/subnet'; fi
+  mapfile -t networks < <(docker network ls -q)
+  if ((${#networks[@]})); then
+    docker network inspect "${networks[@]}" | python3 -c '
+import ipaddress, json, sys
+target=ipaddress.ip_network("172.31.250.0/24")
+for network in json.load(sys.stdin):
+    for cfg in (network.get("IPAM") or {}).get("Config") or []:
+        subnet=cfg.get("Subnet")
+        if subnet and target.overlaps(ipaddress.ip_network(subnet, strict=False)):
+            name=network.get("Name")
+            print(f"Docker network overlap: {name} {subnet}", file=sys.stderr)
+            sys.exit(1)
+' || die 'management subnet overlaps an existing Docker network'
+  fi
+  if docker ps -a --format '{{.Names}}' | grep -q '^clab-routing-lab-'; then die 'containers with this lab prefix already exist; inspect ownership and explicitly destroy this lab before redeploying'; fi
+  for image in quay.io/frrouting/frr:10.2.1 alpine:3.21.3; do
+    if docker image inspect "$image" >/dev/null 2>&1; then printf 'INFO: image available: %s\n' "$image"; else printf 'INFO: image will be pulled during deploy: %s\n' "$image"; fi
+  done
+  containerlab validate -t "$TOPOLOGY"
+  printf 'PASS: preflight completed (free disk %.1f GiB, available RAM %.1f GiB)\n' "$((available_kb/1048576))" "$((mem_kb/1048576))"
+}
+deploy() {
+  preflight
+  started=$(date +%s)
+  if ! containerlab deploy -t "$TOPOLOGY"; then
+    printf 'FAIL: deployment failed; removing resources labeled for this topology only.\n' >&2
+    containerlab destroy -t "$TOPOLOGY" || true
+    return 1
+  fi
+  finished=$(date +%s)
+  printf 'INFO: deployment command completed in %ss\n' "$((finished-started))"
+  if ! validate || ! status; then
+    printf 'FAIL: topology did not reach a healthy baseline; removing resources labeled for this topology only.\n' >&2
+    containerlab destroy -t "$TOPOLOGY" || true
+    return 1
+  fi
+}
+status() {
+  docker_ok
+  containerlab inspect -t "$TOPOLOGY"
+  for r in r1 r2 r3 r4; do
+    printf '\n== %s ==\n' "$r"
+    node "$r" ip -brief addr
+    node "$r" ps -ef | awk '/\/usr\/lib\/frr\/(watchfrr|zebra|bgpd|ospfd|staticd)/ {print}'
+    frr "$r" 'show ip bgp summary' || true
+    frr "$r" 'show ip ospf neighbor' || true
+  done
+  printf '\n== endpoint test ==\n'
+  node client-a ip route
+  node client-b ip route
+  ping_clients
+}
+validate() {
+  docker_ok
+  for r in r1 r2 r3 r4; do wait_for "$r BGP peer" bgp_established "$r" || return 1; done
+  wait_for 'R1/R2 OSPF Full' ospf_full r1 || return 1
+  wait_for 'R3/R4 OSPF Full' ospf_full r3 || return 1
+  wait_for 'R1 learned remote endpoint prefix' has_route r1 10.20.40.0/24 || return 1
+  wait_for 'R4 learned client-A prefix' has_route r4 10.10.10.0/24 || return 1
+  if frr r1 'show ip route 198.51.100.0/24' | grep -q 'B>'; then die 'rejected exercise prefix installed on R1'; fi
+  if frr r2 'show ip route 198.51.100.0/24' | grep -q 'B>'; then die 'rejected exercise prefix installed on R2'; fi
+  wait_for 'endpoint forwarding client-A to client-B' ping_clients || return 1
+  printf 'PASS: baseline routing state observed\n'
+}
+incident() {
+  [[ $# == 1 ]] || die 'usage: make incident NAME=<scenario>'
+  case "$1" in
+    bgp-neighbor) node r1 vtysh -c 'configure terminal' -c 'router bgp 65010' -c 'neighbor 10.0.14.2 shutdown';;
+    ospf-adjacency) node r1 ip link set eth2 down;;
+    route-withdrawal) node r4 vtysh -c 'configure terminal' -c 'router bgp 65020' -c 'address-family ipv4 unicast' -c 'no network 10.20.40.0/24';;
+    link-failure) node r1 ip link set eth3 down;;
+    policy-rejection) frr r3 'show ip bgp ipv4 unicast 198.51.100.0/24'; frr r1 'show ip route 198.51.100.0/24'; frr r2 'show ip route 198.51.100.0/24';;
+    reachability-loss) node r1 ip route replace blackhole 10.20.40.0/24;;
+    *) die 'unknown scenario (bgp-neighbor, ospf-adjacency, route-withdrawal, link-failure, policy-rejection, reachability-loss)' ;;
+  esac
+  printf 'INFO: injected %s. Run status/validate and capture evidence; scenario acceptance is not automatic.\n' "$1"
+}
+recover() {
+  [[ $# == 1 ]] || die 'usage: make recover NAME=<scenario>'
+  case "$1" in
+    bgp-neighbor) node r1 vtysh -c 'configure terminal' -c 'router bgp 65010' -c 'no neighbor 10.0.14.2 shutdown';;
+    ospf-adjacency) node r1 ip link set eth2 up;;
+    route-withdrawal) node r4 vtysh -c 'configure terminal' -c 'router bgp 65020' -c 'address-family ipv4 unicast' -c 'network 10.20.40.0/24';;
+    link-failure) node r1 ip link set eth3 up;;
+    policy-rejection) printf 'No state change was made by the policy observation scenario.\n';;
+    reachability-loss) node r1 ip route del blackhole 10.20.40.0/24;;
+    *) die 'unknown scenario' ;;
+  esac
+  validate
+}
+evidence() {
+  docker_ok
+  mkdir -p "$EVIDENCE"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  out="$EVIDENCE/$stamp"; mkdir -p "$out"
+  { uname -a; cat /etc/os-release; docker version; containerlab version; free -h; df -h "$ROOT"; docker ps --filter 'name=clab-routing-lab-' --format '{{.Names}}'; } >"$out/host.txt" 2>&1
+  mapfile -t containers < <(docker ps -q --filter 'name=clab-routing-lab-')
+  if ((${#containers[@]})); then
+    docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.BlockIO}}' "${containers[@]}" >"$out/container-resources.txt" 2>&1 || true
+    docker inspect --size --format '{{.Name}} rw-bytes={{.SizeRw}} image={{.Image}}' "${containers[@]}" >"$out/container-storage.txt" 2>&1 || true
+  else
+    printf 'No running lab containers.\n' >"$out/container-resources.txt"
+    printf 'No running lab containers.\n' >"$out/container-storage.txt"
+  fi
+  docker image inspect quay.io/frrouting/frr:10.2.1 alpine:3.21.3 --format '{{.RepoTags}} image-bytes={{.Size}}' >"$out/image-sizes.txt" 2>&1 || true
+  "$ROOT/scripts/lab" validate >"$out/validation-timings.txt" 2>&1 || true
+  containerlab inspect -t "$TOPOLOGY" >"$out/topology.txt" 2>&1 || true
+  for r in r1 r2 r3 r4; do
+    { node "$r" ip -brief addr; node "$r" ip route; frr "$r" 'show ip bgp summary'; frr "$r" 'show ip bgp ipv4 unicast'; frr "$r" 'show ip ospf neighbor'; } >"$out/$r.txt" 2>&1 || true
+  done
+  { node client-a ip route; node client-b ip route; ping_clients; } >"$out/endpoints.txt" 2>&1 || true
+  printf 'Evidence: %s\n' "$out"
+}
+destroy() { docker_ok; containerlab destroy -t "$TOPOLOGY" --cleanup; }
+restore_configs() { cp configs/baseline/daemons configs/daemons; cp configs/baseline/vtysh.conf configs/vtysh.conf; for r in r1 r2 r3 r4; do cp "configs/baseline/$r/frr.conf" "configs/$r/frr.conf"; done; }
+reset() { destroy; restore_configs; deploy; }
+case "${1:-}" in
+  preflight) preflight;; deploy) deploy;; status) status;; validate) validate;; incident) shift; incident "$@";; recover) shift; recover "$@";; evidence) evidence;; destroy) destroy;; reset) reset;; *) die 'usage: scripts/lab {preflight|deploy|status|validate|incident NAME|recover NAME|evidence|reset|destroy}';;
+esac

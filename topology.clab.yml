@@ -1,0 +1,77 @@
+name: routing-lab
+topology:
+  nodes:
+    r1:
+      kind: linux
+      image: quay.io/frrouting/frr:10.2.1
+      mgmt-ipv4: 172.31.250.11
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/r1/frr.conf:/etc/frr/frr.conf
+      exec:
+        - ip addr add 10.255.0.1/32 dev lo
+        - ip addr add 10.10.10.1/24 dev eth1
+        - ip addr add 10.0.12.1/30 dev eth2
+        - ip addr add 10.0.14.1/30 dev eth3
+    r2:
+      kind: linux
+      image: quay.io/frrouting/frr:10.2.1
+      mgmt-ipv4: 172.31.250.12
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/r2/frr.conf:/etc/frr/frr.conf
+      exec:
+        - ip addr add 10.255.0.2/32 dev lo
+        - ip addr add 10.0.12.2/30 dev eth1
+        - ip addr add 10.0.23.1/30 dev eth2
+    r3:
+      kind: linux
+      image: quay.io/frrouting/frr:10.2.1
+      mgmt-ipv4: 172.31.250.13
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/r3/frr.conf:/etc/frr/frr.conf
+      exec:
+        - ip addr add 10.255.0.3/32 dev lo
+        - ip addr add 10.0.23.2/30 dev eth1
+        - ip addr add 10.0.34.1/30 dev eth2
+    r4:
+      kind: linux
+      image: quay.io/frrouting/frr:10.2.1
+      mgmt-ipv4: 172.31.250.14
+      binds:
+        - configs/daemons:/etc/frr/daemons
+        - configs/vtysh.conf:/etc/frr/vtysh.conf
+        - configs/r4/frr.conf:/etc/frr/frr.conf
+      exec:
+        - ip addr add 10.255.0.4/32 dev lo
+        - ip addr add 10.0.34.2/30 dev eth1
+        - ip addr add 10.20.40.1/24 dev eth2
+        - ip addr add 10.0.14.2/30 dev eth3
+    client-a:
+      kind: linux
+      image: alpine:3.21.3
+      mgmt-ipv4: 172.31.250.21
+      exec:
+        - ip addr add 10.10.10.10/24 dev eth1
+        - ip route replace default via 10.10.10.1
+    client-b:
+      kind: linux
+      image: alpine:3.21.3
+      mgmt-ipv4: 172.31.250.22
+      exec:
+        - ip addr add 10.20.40.10/24 dev eth1
+        - ip route replace default via 10.20.40.1
+  links:
+    - endpoints: [r1:eth1, client-a:eth1]
+    - endpoints: [r1:eth2, r2:eth1]
+    - endpoints: [r2:eth2, r3:eth1]
+    - endpoints: [r3:eth2, r4:eth1]
+    - endpoints: [r4:eth2, client-b:eth1]
+    - endpoints: [r1:eth3, r4:eth3]
+mgmt:
+  network: routing-lab-mgmt
+  ipv4-subnet: 172.31.250.0/24
